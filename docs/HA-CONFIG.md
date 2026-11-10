@@ -307,81 +307,76 @@ button-card 的 `hold_action: more-info` 指向一个 template select，
 - `mode: single`，重复喊只会排队一次。
 
 
-## 语音取消喂食（一条自动化管两个词）
+## 语音触发喂食 / 换水（含 ASR 容错）
 
-小爱训练里"取消喂鱼"和"取消换水"是同一个触发词，所以自动化也只做**一条**，
-关键词用 or 全列上：
+### 三个必须避开的坑
+
+**坑 1：在 HA 网页 UI 里改模板会把它改坏**
+
+用 UI 的自动化编辑器改别名或关键词后，模板里的换行会被序列化成字面的 `\n` 和 `\ `，
+渲染时报 `TemplateSyntaxError: unexpected char '\'`。这条自动化从此永远不满足条件——
+表现就是"第一次能用，之后怎么喊都没反应"。
+
+**模板一律用 `>-` 块标量写**，不要用双引号单行：
 
 ```yaml
-- id: '1794319100001'
-  alias: 取消喂食
-  triggers:
-  - trigger: state
-    entity_id:
-    - sensor.xiaomi_lx06_ac65_conversation
-    - sensor.xiaomi_lx04_5d57_conversation
   conditions:
   - condition: template
     value_template: >-
       {% set c = state_attr(trigger.entity_id, 'content') | string %}
-      {% set msg_ts = as_timestamp(state_attr(trigger.entity_id, 'timestamp'), default=0) %}
-      {{ ('取消喂鱼' in c or '取消喂食' in c or '不喂了' in c
-          or '取消换水' in c or '换水完了' in c or '换完水了' in c)
-         and msg_ts > 0
-         and (as_timestamp(now()) - msg_ts) < 40 }}
-  # 参照「关闭投影仪」：只在动作有意义时才执行（泵没在正常运转）
-  - condition: template
-    value_template: >-
-      {% set m = state_attr('sensor.netlea_filter','model') %}
-      {{ states('timer.netlea_feed') == 'active'
-         or (m is not none and (m | int(0)) not in [1, 2]) }}
-  actions:
-  - action: script.turn_on
-    target: {entity_id: script.netlea_feed_cancel}
-  mode: single
+      ...
 ```
 
-### 状态条件必须同时看 timer
+**坑 2：连续说同一句话，状态触发不会第二次触发**
 
-`sensor.netlea_filter` 是 **30 秒轮询**的 REST 传感器。刚喂完就喊取消时，
-它的 `model` 属性还是喂食前的 `1`，只用 model 判断会被条件拦住——现象是喊了没反应。
+对话传感器的 state 就是这句话本身。说两遍"大缸喂鱼"，第二次 state 文本没变，
+`trigger: state` 不会触发。改成监听 `timestamp` 属性：
 
-`timer.netlea_feed` 是本地实体，喂食脚本一执行就变 `active`，所以必须 or 上它。
+```yaml
+  triggers:
+  - trigger: state
+    entity_id: [sensor.xiaomi_lx06_ac65_conversation, sensor.xiaomi_lx04_5d57_conversation]
+    attribute: timestamp
+```
 
-### 关键词互斥（反向）
+**坑 3：小爱 ASR 会把「大缸」听成「大纲」**
 
-`取消喂鱼` 含 `喂鱼`，`取消换水` 含 `换水`。所以**喂食/换水那两条**要排除"取消"：
+实测历史里有 `大纲喂食` / `大纲喂鱼` / `大纲位于`。关键词必须放宽：
 
 ```jinja
-{{ ('鱼缸喂食' in c or '喂鱼' in c) and '取消' not in c and ... }}
+{{ ('喂鱼' in c or '喂食' in c)
+   and ('缸' in c or '大纲' in c)
+   and '取消' not in c
+   and '不喂' not in c
+   and '完' not in c
+   and msg_ts > 0
+   and (as_timestamp(now()) - msg_ts) < 40 }}
 ```
 
-## 自动化图标
+换水同理：`'换水' in c and '取消' not in c and '完' not in c`。
+排除 `完` 是为了让"换水完了"只触发取消、不触发 30 分钟喂食。
 
-`automations.yaml` **不支持 `icon:` 键**，写了会报
-`extra keys not allowed @ data['icon']` 并让该自动化整条被禁用（实体变 unavailable）。
+取消一条管全部：`'取消' in c or '不喂' in c or '换水完' in c or '换完水' in c`。
 
-正确做法是写实体注册表：
+### 完整实体
 
-```json
-{"type": "config/entity_registry/update",
- "entity_id": "automation.yu_gang_wei_shi",
- "icon": "mdi:fish"}
+| 实体 | 触发 | 动作 |
+|---|---|---|
+| `automation.yu_gang_wei_shi` | 含"喂鱼/喂食"且含"缸/大纲" | 停泵 10 分钟 |
+| `automation.yu_gang_huan_shui` | 含"换水"，不含"取消/完" | 停泵 30 分钟 |
+| `automation.qu_xiao_wei_shi` | 含"取消/不喂/换水完" | 恢复泵运行 |
+
+三条都带 40 秒时效窗口（防 HA 重启重放旧内容误触发），喂食/换水还要求
+`switch.lu_tong == on`（泵本来就停着不必再喂）。
+
+### 测试方法
+
+不用真喊，直接伪造传感器状态就能走完整链路：
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"state":"大缸喂鱼","attributes":{"content":"大缸喂鱼","timestamp":"<ISO时间>"}}' \
+  http://10.0.0.15:8123/api/states/sensor.xiaomi_lx06_ac65_conversation
 ```
 
-HAOS 上装了 websockets 的 venv：`/root/wsenv/bin/python`（系统 python 没有 websockets/aiohttp）。
-
-当前图标：
-
-| 实体 | 图标 |
-|---|---|
-| 鱼缸喂食 | `mdi:fish` |
-| 鱼缸换水 | `mdi:water-sync` |
-| 取消喂食 | `mdi:water-pump` |
-| 滤桶状态定时刷新 | `mdi:water-pump` |
-
-### 合并自动化后要清理实体注册表
-
-删掉旧自动化后，它的实体条目会留在注册表里变成 `unavailable` 孤儿。
-用 `config/entity_registry/remove` 删掉，用 `config/entity_registry/update` 的
-`new_entity_id` 把改名后的实体 id 一起改掉。
+看 `automation.xxx` 的 `last_triggered` 是否变化，再看设备 `/filter/state` 的 `model`/`feed`。
