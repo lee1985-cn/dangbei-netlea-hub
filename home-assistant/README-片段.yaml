@@ -1,0 +1,96 @@
+# ===== 尼特利滤桶：加到 HA 的配置文件里 =====
+# 用法：把下面三段分别追加到 /homeassistant/ 对应文件末尾，然后重启 HA
+
+# ---------- 1) 追加到 sensor.yaml ----------
+# - platform: rest
+#   name: "滤桶档位"
+#   resource: "http://10.0.0.54/filter/state"
+#   method: GET
+#   value_template: '{{ value_json.gear }}'
+#   scan_interval: 30
+#
+# - platform: rest
+#   name: "滤桶工作模式"
+#   resource: "http://10.0.0.54/filter/state"
+#   method: GET
+#   value_template: '{{ value_json.model }}'
+#   scan_interval: 30
+#
+# - platform: rest
+#   name: "滤桶连接状态"
+#   resource: "http://10.0.0.54/filter/state"
+#   method: GET
+#   value_template: '{{ value_json.connected }}'
+#   scan_interval: 30
+
+# ---------- 2) 追加到 rest_commands.yaml ----------
+# filter_on:
+#   url: "http://10.0.0.54/filter/on"
+#   method: get
+# filter_off:
+#   url: "http://10.0.0.54/filter/off"
+#   method: get
+# filter_read:
+#   url: "http://10.0.0.54/filter/read"
+#   method: get
+# filter_scan:
+#   url: "http://10.0.0.54/filter/scan?s=8"
+#   method: get
+# filter_speed_1:
+#   url: "http://10.0.0.54/filter/speed?n=1"
+#   method: get
+# filter_speed_2:
+#   url: "http://10.0.0.54/filter/speed?n=2"
+#   method: get
+# filter_speed_3:
+#   url: "http://10.0.0.54/filter/speed?n=3"
+#   method: get
+# filter_speed_4:
+#   url: "http://10.0.0.54/filter/speed?n=4"
+#   method: get
+# filter_speed_5:
+#   url: "http://10.0.0.54/filter/speed?n=5"
+#   method: get
+# filter_speed_6:
+#   url: "http://10.0.0.54/filter/speed?n=6"
+#   method: get
+# filter_speed_7:
+#   url: "http://10.0.0.54/filter/speed?n=7"
+#   method: get
+# filter_speed_8:
+#   url: "http://10.0.0.54/filter/speed?n=8"
+#   method: get
+# filter_feed_10:
+#   url: "http://10.0.0.54/filter/feed?min=10"
+#   method: get
+# filter_feed_20:
+#   url: "http://10.0.0.54/filter/feed?min=20"
+#   method: get
+
+# ---------- 3) 追加到 template.yaml ----------
+# 一个开关实体（跟投影仪那个 switch 的做法一致）
+# - switch:
+#     - name: "滤桶"
+#       unique_id: netlea_filter_switch
+#       state: "{{ states('sensor.lu_tong_dang_wei')|int(0) > 0 }}"
+#       turn_on:
+#         - service: rest_command.filter_on
+#       turn_off:
+#         - service: rest_command.filter_off
+#
+# 一个档位下拉
+# - select:
+#     - name: "滤桶档位设置"
+#       unique_id: netlea_filter_gear
+#       options: ["1","2","3","4","5","6","7","8","9","10",
+#                 "11","12","13","14","15","16","17","18","19","20"]
+#       state: "{{ states('sensor.lu_tong_dang_wei') }}"
+#       select_option:
+#         - service: rest_command.filter_speed_{{ option }}
+#
+# 一个喂食按钮
+# - button:
+#     - name: "滤桶喂食10分钟"
+#       unique_id: netlea_filter_feed
+#       press:
+#         - service: rest_command.filter_feed_10
