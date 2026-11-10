@@ -305,3 +305,80 @@ button-card 的 `hold_action: more-info` 指向一个 template select，
   content，没有时效窗口就会在重启后误触发。
 - `switch.lu_tong` 必须是 `on` 才执行——泵本来就停着的时候不必再喂食。
 - `mode: single`，重复喊只会排队一次。
+
+
+## 语音取消喂食 / 取消换水
+
+「取消喂鱼」「取消换水」喊一声就把泵恢复，动作走 `script.netlea_feed_cancel`。
+
+### 关键词必须互斥
+
+`取消喂鱼` 里含 `喂鱼`，`取消换水` 里含 `换水`。不排除的话喊"取消"会**先重新喂一遍再取消**：
+
+```jinja
+{{ ('鱼缸喂食' in c or '喂鱼' in c)
+   and '取消' not in c
+   and msg_ts > 0
+   and (as_timestamp(now()) - msg_ts) < 40 }}
+```
+
+### 取消脚本的等待要算，不要写死
+
+设备在喂食开始后约 25 秒内拒绝控制命令。写死 `delay: 25` 会让"喂了十分钟再取消"也白等 25 秒。
+按已过时长动态计算：
+
+```yaml
+- delay:
+    seconds: >-
+      {% set fin = state_attr('timer.netlea_feed','finishes_at') %}
+      {% set dur = state_attr('timer.netlea_feed','duration') %}
+      {% if fin and dur and states('timer.netlea_feed') == 'active' %}
+        {% set total = as_timedelta(dur).total_seconds() | int(0) %}
+        {% set left = (as_timestamp(fin) - as_timestamp(now())) | int(0) %}
+        {{ [0, 26 - (total - left)] | max }}
+      {% else %}0{% endif %}
+```
+
+### 两条 BLE 命令不能抢
+
+喂食脚本和取消脚本都走同一条 BLE 连接。取消脚本重试期间（最多约 20 秒）再点喂食，
+喂食命令会失败——现象是 `timer` 变成 active 但设备 `model` 还是 1（泵根本没停）。
+
+解决：
+
+1. `netlea_feed_cancel` 用 `mode: restart`，否则连续两次取消会报 `Already running` 被丢弃。
+2. **三个喂食脚本开头都先 `script.turn_off` 掉取消脚本**，让最新意图赢。
+
+```yaml
+netlea_feed_10:
+  sequence:
+    - action: script.turn_off
+      target: {entity_id: script.netlea_feed_cancel}
+    - action: timer.start
+      ...
+```
+
+## 自动化图标
+
+`automations.yaml` **不支持 `icon:` 键**，写了会报
+`extra keys not allowed @ data['icon']` 并让该自动化整条被禁用（实体变 unavailable）。
+
+正确做法是写实体注册表：
+
+```json
+{"type": "config/entity_registry/update",
+ "entity_id": "automation.yu_gang_wei_shi",
+ "icon": "mdi:fish"}
+```
+
+HAOS 上装了 websockets 的 venv：`/root/wsenv/bin/python`（系统 python 没有 websockets/aiohttp）。
+
+当前图标：
+
+| 实体 | 图标 |
+|---|---|
+| 鱼缸喂食 | `mdi:fish` |
+| 鱼缸换水 | `mdi:water-sync` |
+| 取消喂鱼 | `mdi:fish-off` |
+| 取消换水 | `mdi:water-check` |
+| 滤桶状态定时刷新 | `mdi:water-pump` |
