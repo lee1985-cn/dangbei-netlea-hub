@@ -267,3 +267,41 @@ button-card 的 `hold_action: more-info` 指向一个 template select，
                   target: {entity_id: script.netlea_feed_10}
             # ... 20/30 同理
 ```
+
+
+## 语音触发喂食（小爱同学）
+
+沿用「打开投影仪 / 打开电脑」那套写法：监听小爱对话传感器 + 关键词 + 40 秒时效窗口。
+
+```yaml
+- id: '1794318500001'
+  alias: 鱼缸喂食
+  triggers:
+  - trigger: state
+    entity_id:
+    - sensor.xiaomi_lx06_ac65_conversation
+    - sensor.xiaomi_lx04_5d57_conversation
+  conditions:
+  - condition: template
+    value_template: >-
+      {% set c = state_attr(trigger.entity_id, 'content') | string %}
+      {% set msg_ts = as_timestamp(state_attr(trigger.entity_id, 'timestamp'), default=0) %}
+      {{ ('鱼缸喂食' in c or '喂鱼' in c)
+         and msg_ts > 0
+         and (as_timestamp(now()) - msg_ts) < 40 }}
+  - condition: state
+    entity_id: switch.lu_tong
+    state: ['on']
+  actions:
+  - action: script.turn_on
+    target: {entity_id: script.netlea_feed_10}
+  mode: single
+```
+
+「鱼缸换水」同构，关键词 `鱼缸换水` / `换水`，动作换成 `script.netlea_feed_30`。
+
+要点：
+- **必须做 40 秒时效判断**。对话传感器是"状态"实体，HA 重启或集成重连会重新写一次同样的
+  content，没有时效窗口就会在重启后误触发。
+- `switch.lu_tong` 必须是 `on` 才执行——泵本来就停着的时候不必再喂食。
+- `mode: single`，重复喊只会排队一次。
