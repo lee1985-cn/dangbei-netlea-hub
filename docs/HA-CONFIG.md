@@ -307,55 +307,53 @@ button-card 的 `hold_action: more-info` 指向一个 template select，
 - `mode: single`，重复喊只会排队一次。
 
 
-## 语音取消喂食 / 取消换水
+## 语音取消喂食（一条自动化管两个词）
 
-「取消喂鱼」「取消换水」喊一声就把泵恢复，动作走 `script.netlea_feed_cancel`。
+小爱训练里"取消喂鱼"和"取消换水"是同一个触发词，所以自动化也只做**一条**，
+关键词用 or 全列上：
 
-### 关键词必须互斥
+```yaml
+- id: '1794319100001'
+  alias: 取消喂食
+  triggers:
+  - trigger: state
+    entity_id:
+    - sensor.xiaomi_lx06_ac65_conversation
+    - sensor.xiaomi_lx04_5d57_conversation
+  conditions:
+  - condition: template
+    value_template: >-
+      {% set c = state_attr(trigger.entity_id, 'content') | string %}
+      {% set msg_ts = as_timestamp(state_attr(trigger.entity_id, 'timestamp'), default=0) %}
+      {{ ('取消喂鱼' in c or '取消喂食' in c or '不喂了' in c
+          or '取消换水' in c or '换水完了' in c or '换完水了' in c)
+         and msg_ts > 0
+         and (as_timestamp(now()) - msg_ts) < 40 }}
+  # 参照「关闭投影仪」：只在动作有意义时才执行（泵没在正常运转）
+  - condition: template
+    value_template: >-
+      {% set m = state_attr('sensor.netlea_filter','model') %}
+      {{ states('timer.netlea_feed') == 'active'
+         or (m is not none and (m | int(0)) not in [1, 2]) }}
+  actions:
+  - action: script.turn_on
+    target: {entity_id: script.netlea_feed_cancel}
+  mode: single
+```
 
-`取消喂鱼` 里含 `喂鱼`，`取消换水` 里含 `换水`。不排除的话喊"取消"会**先重新喂一遍再取消**：
+### 状态条件必须同时看 timer
+
+`sensor.netlea_filter` 是 **30 秒轮询**的 REST 传感器。刚喂完就喊取消时，
+它的 `model` 属性还是喂食前的 `1`，只用 model 判断会被条件拦住——现象是喊了没反应。
+
+`timer.netlea_feed` 是本地实体，喂食脚本一执行就变 `active`，所以必须 or 上它。
+
+### 关键词互斥（反向）
+
+`取消喂鱼` 含 `喂鱼`，`取消换水` 含 `换水`。所以**喂食/换水那两条**要排除"取消"：
 
 ```jinja
-{{ ('鱼缸喂食' in c or '喂鱼' in c)
-   and '取消' not in c
-   and msg_ts > 0
-   and (as_timestamp(now()) - msg_ts) < 40 }}
-```
-
-### 取消脚本的等待要算，不要写死
-
-设备在喂食开始后约 25 秒内拒绝控制命令。写死 `delay: 25` 会让"喂了十分钟再取消"也白等 25 秒。
-按已过时长动态计算：
-
-```yaml
-- delay:
-    seconds: >-
-      {% set fin = state_attr('timer.netlea_feed','finishes_at') %}
-      {% set dur = state_attr('timer.netlea_feed','duration') %}
-      {% if fin and dur and states('timer.netlea_feed') == 'active' %}
-        {% set total = as_timedelta(dur).total_seconds() | int(0) %}
-        {% set left = (as_timestamp(fin) - as_timestamp(now())) | int(0) %}
-        {{ [0, 26 - (total - left)] | max }}
-      {% else %}0{% endif %}
-```
-
-### 两条 BLE 命令不能抢
-
-喂食脚本和取消脚本都走同一条 BLE 连接。取消脚本重试期间（最多约 20 秒）再点喂食，
-喂食命令会失败——现象是 `timer` 变成 active 但设备 `model` 还是 1（泵根本没停）。
-
-解决：
-
-1. `netlea_feed_cancel` 用 `mode: restart`，否则连续两次取消会报 `Already running` 被丢弃。
-2. **三个喂食脚本开头都先 `script.turn_off` 掉取消脚本**，让最新意图赢。
-
-```yaml
-netlea_feed_10:
-  sequence:
-    - action: script.turn_off
-      target: {entity_id: script.netlea_feed_cancel}
-    - action: timer.start
-      ...
+{{ ('鱼缸喂食' in c or '喂鱼' in c) and '取消' not in c and ... }}
 ```
 
 ## 自动化图标
@@ -379,6 +377,11 @@ HAOS 上装了 websockets 的 venv：`/root/wsenv/bin/python`（系统 python �
 |---|---|
 | 鱼缸喂食 | `mdi:fish` |
 | 鱼缸换水 | `mdi:water-sync` |
-| 取消喂鱼 | `mdi:fish-off` |
-| 取消换水 | `mdi:water-check` |
+| 取消喂食 | `mdi:water-pump` |
 | 滤桶状态定时刷新 | `mdi:water-pump` |
+
+### 合并自动化后要清理实体注册表
+
+删掉旧自动化后，它的实体条目会留在注册表里变成 `unavailable` 孤儿。
+用 `config/entity_registry/remove` 删掉，用 `config/entity_registry/update` 的
+`new_entity_id` 把改名后的实体 id 一起改掉。
