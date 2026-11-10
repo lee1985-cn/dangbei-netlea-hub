@@ -92,8 +92,13 @@ pio run -e esp32c3_ota -t upload      # 局域网 OTA
 arduino-cli core install esp32:esp32@2.0.17
 arduino-cli lib install "NimBLE-Arduino@1.4.3"
 # 把 lib/ESP32-BLE-Keyboard 拷到 ~/Arduino/libraries/
-arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app src
+arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app \
+  --build-property "compiler.cpp.extra_flags=-DUSE_NIMBLE" src
 ```
+
+> ⚠️ `-DUSE_NIMBLE` **必须作为全局编译参数传**。写在 `.ino` 顶部的 `#define` 只对 sketch 生效，
+> 不会传给库文件，结果是 BleKeyboard 用 Bluedroid、滤桶客户端用 NimBLE，两个蓝牙栈并存，
+> NimBLE 根本没初始化，扫描和连接会静默失败。PlatformIO 的 `build_flags` 是全局的，没这个坑。
 
 ---
 
@@ -112,15 +117,17 @@ const char* password = "你的wifi密码";
 esptool.py --port COM3 read_flash 0 0x400000 backup.bin
 ```
 
-3. 烧录。**只写三个区，别动 NVS**：
+3. 烧录。**只写 app，不要覆盖 bootloader**：
 
 ```bash
 esptool.py --port COM3 write_flash \
   --flash_mode dio --flash_freq 80m --flash_size 4MB \
-  0x0      bootloader.bin \
-  0x8000   partitions.bin \
   0x10000  app.bin
 ```
+
+> ⚠️ **不要刷 bootloader**。实测把 arduino-cli 编出来的 `bootloader.bin` 写进去会导致无限重启
+> （`rst:0x3` 循环，串口只剩 ROM 横幅）。板子上原有的 bootloader 是好用的，分区表与原厂逐字节一致，
+> 两者都不用动。只换 app 分区（0x10000）即可。
 
 > 不动 `0x9000` 的 NVS，投影仪的蓝牙配对密钥就还在，换固件不用重新配对。
 

@@ -47,7 +47,10 @@ static NimBLEUUID CH_VOICE ("0003cbbb-0000-1000-8000-00805f9beee5");
 static const uint8_t CRC_KEY[8] = {76,101,100,115,38,70,117,110}; // "Leds&Fun"
 
 Preferences prefs;
-String filterMac = "";          // 滤桶 MAC，首次可自动发现或手动设置
+String filterMac = "";
+// 出厂默认滤桶 MAC（可用 /filter/setmac 覆盖；留空则开机时自动扫描）
+#define FILTER_MAC_DEFAULT ""   // 留空则开机时用 /filter/scan 自动发现，或用 /filter/setmac 指定
+int fAddrType = -1;   // 扫描时记下的地址类型，-1=未知          // 滤桶 MAC，首次可自动发现或手动设置
 
 // 最近一次状态
 int   fGear = -1;      // 档位 0=停
@@ -116,9 +119,10 @@ void filterParseNotify(const uint8_t* frame, size_t n) {
   uint8_t plain[64];
   size_t m = nlDecode(frame, n, plain);
   if (m < 8) return;
+  // 实测布局（NL NO.1S-G1）：[1]电量 [2]电压 [3]档位 [4]流量等级 [6]工作模式 [7]错误码
   fCharge   = plain[1];
   fElectric = plain[2];
-  fGear     = plain[4];
+  fGear     = plain[3];
   fModel    = plain[6];
   fErr      = plain[7];
   fLastSeen = millis();
@@ -126,33 +130,52 @@ void filterParseNotify(const uint8_t* frame, size_t n) {
 }
 
 void filterNotifyCB(NimBLERemoteCharacteristic* ch, uint8_t* data, size_t len, bool isNotify) {
+  char hx[200]; int p = 0;
+  for (size_t i = 0; i < len && p < 190; i++) p += snprintf(hx + p, sizeof(hx) - p, "%02x ", data[i]);
+  ets_printf("[FILTER] notify len=%d raw=%s\n", (int)len, hx);
   filterParseNotify(data, len);
 }
 
+unsigned long fLastUse = 0;
+const unsigned long FILTER_IDLE_MS = 20000;   // 空闲 20 秒自动断开，把连接让给手机小程序
+
+// 建立/复用连接（带重试）。长连接，不再每次发完就断
 bool filterConnect() {
   if (filterMac.length() == 0) return false;
-  if (fClient && fClient->isConnected()) return true;
+  if (fClient && fClient->isConnected()) { fLastUse = millis(); return true; }
 
   if (!fClient) {
     fClient = NimBLEDevice::createClient();
     fClient->setClientCallbacks(new FilterNotifyCB(), false);
-    fClient->setConnectTimeout(8000);
+    fClient->setConnectTimeout(5);   // 参数是 uint8_t，单位秒
   }
-  if (!fClient->connect(NimBLEAddress(std::string(filterMac.c_str()), BLE_ADDR_PUBLIC))) {
-    // 部分模块用随机地址
-    if (!fClient->connect(NimBLEAddress(std::string(filterMac.c_str()), BLE_ADDR_RANDOM))) {
-      Serial.println("[FILTER] connect failed");
-      return false;
+
+  uint8_t types[2] = {BLE_ADDR_PUBLIC, BLE_ADDR_RANDOM};
+  if (fAddrType == 0 || fAddrType == 1) {
+    types[0] = fAddrType;
+    types[1] = (fAddrType == 0) ? BLE_ADDR_RANDOM : BLE_ADDR_PUBLIC;
+  }
+
+  for (int attempt = 0; attempt < 3 && !fClient->isConnected(); attempt++) {
+    for (int i = 0; i < 2 && !fClient->isConnected(); i++) {
+      bool ok = fClient->connect(NimBLEAddress(std::string(filterMac.c_str()), types[i]));
+      ets_printf("[FILTER] connect a=%d type=%d -> %d\n", attempt, (int)types[i], (int)ok);
+      if (!ok) { fClient->disconnect(); delay(250); }
     }
+    if (!fClient->isConnected()) delay(500);
   }
+  if (!fClient->isConnected()) { ets_printf("[FILTER] connect failed\n"); return false; }
+
   auto* svc = fClient->getService(SVC_FILTER);
-  if (!svc) { Serial.println("[FILTER] service not found"); fClient->disconnect(); return false; }
-
+  if (!svc) { ets_printf("[FILTER] no svc\n"); fClient->disconnect(); return false; }
   auto* chN = svc->getCharacteristic(CH_NOTIFY);
-  if (chN && chN->canNotify()) chN->subscribe(true, filterNotifyCB);
-
+  if (chN && chN->canNotify()) {
+    chN->subscribe(true, filterNotifyCB);
+    delay(200);   // 等 CCCD 生效
+  }
   fConnected = true;
-  Serial.println("[FILTER] connected");
+  fLastUse = millis();
+  ets_printf("[FILTER] connected\n");
   return true;
 }
 
@@ -161,44 +184,73 @@ void filterDisconnect() {
   fConnected = false;
 }
 
-// 发一条控制帧后断开（单连接设备，必须让出连接）
+// 在 loop 里调用：空闲超时主动断开，避免长期占着设备
+void filterIdleCheck() {
+  if (fClient && fClient->isConnected() && fLastUse && (millis() - fLastUse > FILTER_IDLE_MS)) {
+    ets_printf("[FILTER] idle disconnect\n");
+    filterDisconnect();
+  }
+}
+
+// 写控制帧（EEE1）
 bool filterSendCtl(bool on, int model, int gear, int level, int timing) {
   if (!filterConnect()) return false;
   auto* svc = fClient->getService(SVC_FILTER);
-  if (!svc) { filterDisconnect(); return false; }
-  auto* ch = svc->getCharacteristic(CH_CTL);
+  auto* ch = svc ? svc->getCharacteristic(CH_CTL) : nullptr;
   if (!ch) { filterDisconnect(); return false; }
 
   uint8_t plain[12], frame[16];
   buildCtl(plain, on, model, gear, level, timing);
   size_t n = nlEncode(plain, sizeof(plain), frame);
   bool ok = ch->writeValue(frame, n, false);
-  delay(150);            // 给设备一点时间回包
-  filterDisconnect();
+  unsigned long tw = millis();
+  while (millis() - tw < 700) { delay(20); }
+  fLastUse = millis();
   return ok;
 }
 
-bool filterSendRaw(const uint8_t* plain, size_t n) {
+// 写任意明文帧到指定特征值
+bool filterSendRawTo(const uint8_t* plain, size_t n, NimBLEUUID target) {
   if (!filterConnect()) return false;
   auto* svc = fClient->getService(SVC_FILTER);
-  if (!svc) { filterDisconnect(); return false; }
-  auto* ch = svc->getCharacteristic(CH_CTL);
+  auto* ch = svc ? svc->getCharacteristic(target) : nullptr;
   if (!ch) { filterDisconnect(); return false; }
   uint8_t frame[80];
   size_t fn = nlEncode(plain, n, frame);
   bool ok = ch->writeValue(frame, fn, false);
-  delay(150);
-  filterDisconnect();
+  unsigned long tw = millis();
+  while (millis() - tw < 900) { delay(20); }
+  fLastUse = millis();
   return ok;
 }
 
+bool filterSendRaw(const uint8_t* plain, size_t n) {
+  return filterSendRawTo(plain, n, CH_CTL);
+}
+
 // 扫描：按服务 UUID 或名字找滤桶，同时把附近设备打到串口
+int gScanCount = -1;
+int gScanOk = -1;
+unsigned long gScanMs = 0;
+
 String filterScan(int seconds, bool verbose) {
+  unsigned long t0 = millis();
   NimBLEScan* scan = NimBLEDevice::getScan();
+  if (!scan) { gScanCount = -2; gScanOk = -2; return ""; }
   scan->setActiveScan(true);
   scan->setInterval(100);
   scan->setWindow(80);
-  NimBLEScanResults res = scan->start(seconds, false);
+  // 用非阻塞 API，自己等，避免阻塞版在 start() 失败时静默返回
+  bool ok = scan->start((uint32_t)seconds, nullptr, false);
+  gScanOk = ok ? 1 : 0;
+  ets_printf("[SCAN] start ok=%d\n", (int)ok);
+  unsigned long w = millis();
+  while (millis() - w < (unsigned long)seconds * 1000UL) { delay(50); }
+  scan->stop();
+  NimBLEScanResults res = scan->getResults();
+  gScanMs = millis() - t0;
+  gScanCount = res.getCount();
+  ets_printf("[SCAN] done ok=%d count=%d elapsed=%lu\n", gScanOk, gScanCount, gScanMs);
   String found = "";
   String all = "";
   for (int i = 0; i < res.getCount(); i++) {
@@ -206,9 +258,12 @@ String filterScan(int seconds, bool verbose) {
     String name = d.haveName() ? String(d.getName().c_str()) : String("");
     String mac  = String(d.getAddress().toString().c_str());
     bool hasSvc = d.haveServiceUUID() && d.getServiceUUID().equals(SVC_FILTER);
-    all += mac + "|" + name + "|" + String(d.getRSSI()) + "\n";
+    all += mac + "|" + name + "|" + String(d.getRSSI()) + "|type=" + String((int)d.getAddress().getType()) + "\n";
+    ets_printf("[SCAN] %s %s rssi=%d type=%d\n", mac.c_str(), name.c_str(), d.getRSSI(), (int)d.getAddress().getType());
     if (hasSvc || name.indexOf("NETLEA") >= 0 || name.indexOf("netlea") >= 0 || name.indexOf("NTL") >= 0) {
       found = mac;
+      fAddrType = (int)d.getAddress().getType();
+      ets_printf("[SCAN] MATCH %s type=%d\n", mac.c_str(), fAddrType);
       if (verbose) Serial.println("[FILTER] found " + mac + " " + name);
     }
   }
@@ -239,6 +294,7 @@ void broadcastPacket(NimBLEAdvertising* adv, const uint8_t* pkt, size_t len, uns
 }
 
 void runWakeupBeaconMode() {
+  ets_printf("[A] wakeup beacon mode\n");
   Serial.println("\n[MODE A] 发射魔法唤醒包...");
   NimBLEDevice::init(BLE_NAME);
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
@@ -331,16 +387,16 @@ void setupHttpEndpoints() {
     addCors();
     char buf[220];
     snprintf(buf, sizeof(buf),
-      "{\"connected\":%s,\"gear\":%d,\"model\":%d,\"err\":%d,\"charge\":%d,\"voltage\":%d,\"mac\":\"%s\",\"age_ms\":%lu}",
+      "{\"connected\":%s,\"gear\":%d,\"model\":%d,\"err\":%d,\"charge\":%d,\"voltage\":%d,\"mac\":\"%s\",\"age_ms\":%lu,\"uptime_ms\":%lu}",
       fConnected ? "true" : "false", fGear, fModel, fErr, fCharge, fElectric,
-      filterMac.c_str(), fLastSeen ? (millis() - fLastSeen) : 0UL);
+      filterMac.c_str(), fLastSeen ? (millis() - fLastSeen) : 0UL, millis());
     server.send(200, "application/json", buf);
   });
 
   server.on("/filter/read", HTTP_GET, []() {
     addCors();
     uint8_t cmd[2] = {0x02, 0x02};
-    bool ok = filterSendRaw(cmd, 2);
+    bool ok = filterSendRawTo(cmd, 2, CH_NOTIFY);   // 小程序把读命令写在 EEE4
     char buf[80];
     snprintf(buf, sizeof(buf), "{\"sent\":%s,\"gear\":%d,\"model\":%d}", ok ? "true" : "false", fGear, fModel);
     server.send(200, "application/json", buf);
@@ -392,11 +448,62 @@ void setupHttpEndpoints() {
     server.send(200, "application/json", ok ? "{\"sent\":true}" : "{\"sent\":false}");
   });
 
+  server.on("/filter/dump", HTTP_GET, []() {
+    addCors();
+    if (!filterConnect()) { server.send(200, "application/json", "{\"error\":\"connect failed\"}"); return; }
+    auto* svc = fClient->getService(SVC_FILTER);
+    if (!svc) { filterDisconnect(); server.send(200, "application/json", "{\"error\":\"no svc\"}"); return; }
+    String j = "{\"chars\":[";
+    auto* chars = svc->getCharacteristics(true);
+    bool first = true;
+    for (auto* c : *chars) {
+      if (!first) j += ",";
+      first = false;
+      j += "{\"uuid\":\"" + String(c->getUUID().toString().c_str()) + "\"";
+      j += ",\"read\":" + String(c->canRead() ? "true" : "false");
+      j += ",\"write\":" + String(c->canWrite() ? "true" : "false");
+      j += ",\"writeNR\":" + String(c->canWriteNoResponse() ? "true" : "false");
+      j += ",\"notify\":" + String(c->canNotify() ? "true" : "false");
+      j += ",\"indicate\":" + String(c->canIndicate() ? "true" : "false");
+      j += "}";
+      ets_printf("[DUMP] %s r=%d w=%d wnr=%d n=%d i=%d\n", c->getUUID().toString().c_str(),
+                 c->canRead(), c->canWrite(), c->canWriteNoResponse(), c->canNotify(), c->canIndicate());
+    }
+    j += "]}";
+    filterDisconnect();
+    server.send(200, "application/json", j);
+  });
+
+  // 直接 GATT 读 EEE4 拿状态（比 notify 省事，设备所有特征值都支持 read）
+  server.on("/filter/readgatt", HTTP_GET, []() {
+    addCors();
+    if (!filterConnect()) { server.send(200, "application/json", "{\"error\":\"connect failed\"}"); return; }
+    auto* svc = fClient->getService(SVC_FILTER);
+    auto* ch = svc ? svc->getCharacteristic(CH_NOTIFY) : nullptr;
+    if (!ch) { filterDisconnect(); server.send(200, "application/json", "{\"error\":\"no char\"}"); return; }
+    auto v = ch->readValue();
+    uint8_t buf[64];
+    size_t n = v.length() < sizeof(buf) ? v.length() : sizeof(buf);
+    memcpy(buf, v.data(), n);
+    char hx[220]; int q = 0;
+    for (size_t i = 0; i < n && q < 210; i++) q += snprintf(hx + q, sizeof(hx) - q, "%02x ", buf[i]);
+    ets_printf("[FILTER] readgatt len=%d raw=%s\n", (int)n, hx);
+    filterParseNotify(buf, n);
+    filterDisconnect();
+    char out[320];
+    snprintf(out, sizeof(out), "{\"len\":%d,\"raw\":\"%s\",\"gear\":%d,\"model\":%d,\"err\":%d,\"charge\":%d,\"voltage\":%d}",
+             (int)n, hx, fGear, fModel, fErr, fCharge, fElectric);
+    server.send(200, "application/json", out);
+  });
+
   server.on("/filter/scan", HTTP_GET, []() {
     addCors();
     int s = server.hasArg("s") ? server.arg("s").toInt() : 6;
     String found = filterScan(s, true);
-    String body = "{\"found\":\"" + found + "\",\"mac\":\"" + filterMac + "\"}";
+    String body = "{\"found\":\"" + found + "\",\"mac\":\"" + filterMac +
+                  "\",\"ok\":" + String(gScanOk) + ",\"count\":" + String(gScanCount) +
+                  ",\"elapsed_ms\":" + String(gScanMs) +
+                  ",\"requested_s\":" + String(s) + "}";
     server.send(200, "application/json", body);
   });
 
@@ -404,7 +511,8 @@ void setupHttpEndpoints() {
     addCors();
     if (!server.hasArg("mac")) { server.send(400, "application/json", "{\"error\":\"need ?mac=AA:BB:...\"}"); return; }
     filterMac = server.arg("mac");
-    prefs.putString("fmac", filterMac);
+    size_t w = prefs.putString("fmac", filterMac);
+    ets_printf("[SETMAC] wrote=%d readback=[%s]\n", (int)w, prefs.getString("fmac","").c_str());
     server.send(200, "application/json", "{\"mac\":\"" + filterMac + "\"}");
   });
 }
@@ -455,14 +563,22 @@ void startConfigPortal() {
 void runNormalControlMode() {
   Serial.println("\n[MODE B] 进入常态控制模式...");
 
-  prefs.begin("dangbei", false);
+  ets_printf("[B] prefs.begin\n");
+  bool pb = prefs.begin("dangbei", false);
+  ets_printf("[B] prefs.begin=%d\n", (int)pb);
   filterMac = prefs.getString("fmac", "");
+  if (filterMac.length() == 0) { filterMac = FILTER_MAC_DEFAULT; ets_printf("[B] use default fmac\n"); }
+  ets_printf("[B] fmac=[%s]\n", filterMac.c_str());
   wifiSsid = prefs.getString("wssid", ssid);
   wifiPass = prefs.getString("wpass", password);
 
+  ets_printf("[B] BleKeyboard new\n");
   bleKeyboard = new BleKeyboard(BLE_NAME, "Espressif", 100);
+  ets_printf("[B] BleKeyboard begin\n");
   bleKeyboard->begin();
+  ets_printf("[B] BleKeyboard ok\n");
 
+  ets_printf("[B] wifi connect\n");
   if (!wifiConnect(WIFI_TIMEOUT_MS)) {
     // 再给一次机会（有的路由器握手慢）
     if (!wifiConnect(5000)) {
@@ -471,6 +587,7 @@ void runNormalControlMode() {
   }
   Serial.println("\nWiFi OK! IP: " + WiFi.localIP().toString());
 
+  ets_printf("[B] wifi ok ip=%s\n", WiFi.localIP().toString().c_str());
   // OTA：以后改固件不用拆板子
   ArduinoOTA.setHostname("dangbei-esp32");
   ArduinoOTA.onStart([]() { Serial.println("[OTA] start"); });
@@ -478,8 +595,10 @@ void runNormalControlMode() {
   ArduinoOTA.onError([](ota_error_t e) { Serial.printf("[OTA] error %u\n", e); });
   ArduinoOTA.begin();
 
+  ets_printf("[B] endpoints\n");
   setupHttpEndpoints();
   server.begin();
+  ets_printf("[B] server started\n");
 
   if (filterMac.length()) {
     Serial.println("[FILTER] configured MAC: " + filterMac);
@@ -489,17 +608,24 @@ void runNormalControlMode() {
 }
 
 void setup() {
+  ets_printf("\n[BOOT] reset_reason=%d\n", (int)esp_reset_reason());
   Serial.begin(115200);
+  ets_printf("[BOOT] serial ready\n");
 
   // 【核心补丁 5】强制初始化 NVS，确保蓝牙配对密钥断电不丢
+  ets_printf("[BOOT] nvs_init begin\n");
   esp_err_t ret = nvs_flash_init();
   if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    ets_printf("[BOOT] nvs erase\n");
     nvs_flash_erase();
     nvs_flash_init();
   }
+  ets_printf("[BOOT] nvs ok ret=%d\n", (int)ret);
 
   esp_reset_reason_t reason = esp_reset_reason();
+  ets_printf("[BOOT] reason=%d magic=%08x\n", (int)reason, (unsigned)boot_mode_magic);
   if (reason != ESP_RST_SW) { boot_mode_magic = 0; }
+  ets_printf("[BOOT] after clear magic=%08x\n", (unsigned)boot_mode_magic);
 
   if (boot_mode_magic == MAGIC_WAKEUP) {
     runWakeupBeaconMode();
@@ -512,5 +638,6 @@ void loop() {
   if (boot_mode_magic != MAGIC_WAKEUP) {
     server.handleClient();
     ArduinoOTA.handle();
+    filterIdleCheck();
   }
 }
