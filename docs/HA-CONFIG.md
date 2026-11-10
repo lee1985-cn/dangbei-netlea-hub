@@ -175,3 +175,48 @@ options: "{{ range(1, 21) | map('string') | list }}"
 ## 7. 单连接提醒
 
 ESP32 连着滤桶时手机小程序连不上。固件是"命令后保持 20 秒、空闲自动断开"，所以你在家随时能用小程序，代价是状态有最多 30 秒延迟。
+
+
+## 喂食开关（点一下喂 / 再点取消）
+
+小米鱼缸那种"点一下喂食、再点一下取消"的交互，靠一个分支脚本实现：
+
+```yaml
+netlea_feed_toggle:
+  alias: 滤桶喂食切换
+  mode: single
+  sequence:
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: timer.netlea_feed
+              state: active
+          sequence:
+            - action: script.turn_on
+              target: {entity_id: script.netlea_feed_cancel}
+      default:
+        - action: script.turn_on
+          target: {entity_id: script.netlea_feed_10}
+```
+
+取消脚本必须**先等 25 秒**（设备保护窗口）**再** `timer.cancel`，顺序反了会让卡片提前显示"已结束"但泵还没恢复：
+
+```yaml
+netlea_feed_cancel:
+  mode: single
+  sequence:
+    - delay: {seconds: 25}          # 等过保护窗口，卡片显示"取消中…"
+    - action: timer.cancel
+      target: {entity_id: timer.netlea_feed}
+    - repeat:                        # 重发当前档位（=取消喂食）
+        count: 3
+        sequence:
+          - action: shell_command.netlea_speed_cmd
+            data: {n: "{{ states('sensor.lu_tong_dang_wei_ji_yi') | int(8) }}"}
+          - delay: {seconds: 4}
+    - delay: {seconds: 2}
+    - action: shell_command.netlea_read_cmd   # 收尾回读，档位/模式立刻恢复
+```
+
+卡片用 `script.netlea_feed_cancel` 的 `on` 状态显示"取消中…"，
+因为这段时间 timer 还是 active（泵确实还没转起来），显示与实际一致。
