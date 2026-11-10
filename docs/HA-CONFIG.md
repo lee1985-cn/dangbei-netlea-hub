@@ -220,3 +220,50 @@ netlea_feed_cancel:
 
 卡片用 `script.netlea_feed_cancel` 的 `on` 状态显示"取消中…"，
 因为这段时间 timer 还是 active（泵确实还没转起来），显示与实际一致。
+
+
+## 开关实体状态判断（必读）
+
+```yaml
+- switch:
+    - name: "滤桶"
+      unique_id: netlea_filter_switch
+      # model: 1/2=运行 3=喂食 6=关闭。gear 关泵时仍保留上次档位，不能单看 gear。
+      state: >-
+        {% set m = state_attr('sensor.netlea_filter','model')|int(0) %}
+        {% set g = state_attr('sensor.netlea_filter','gear')|int(0) %}
+        {{ (m in [1,2,3]) and (g > 0 or m == 3) }}
+      turn_on:
+        - action: shell_command.netlea_on_cmd
+        - action: homeassistant.update_entity
+          target: {entity_id: sensor.netlea_filter}
+      turn_off:
+        - action: shell_command.netlea_off_cmd
+        - action: homeassistant.update_entity
+          target: {entity_id: sensor.netlea_filter}
+```
+
+`turn_on` / `turn_off` 后面必须跟一次 `homeassistant.update_entity`，
+否则 REST 传感器要等 30 秒轮询，卡片图标会滞后。
+
+## 长按选喂食时长
+
+button-card 的 `hold_action: more-info` 指向一个 template select，
+下拉选 10/20/30 分钟就触发对应脚本：
+
+```yaml
+- select:
+    - name: "滤桶喂食时长"
+      unique_id: netlea_feed_duration
+      # options 必须是模板字符串；写成 YAML 列表会被静默丢弃
+      options: "{{ ['选时长','10分钟','20分钟','30分钟'] }}"
+      # state 恒为"选时长"，所以每次下拉选同一个时长都算变化，一定会触发
+      state: "选时长"
+      select_option:
+        - choose:
+            - conditions: "{{ option == '10分钟' }}"
+              sequence:
+                - action: script.turn_on
+                  target: {entity_id: script.netlea_feed_10}
+            # ... 20/30 同理
+```
