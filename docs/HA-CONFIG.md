@@ -1,138 +1,177 @@
 # 添加尼特利滤桶到 Home Assistant
 
-固件跑起来、`http://<ESP32-IP>/filter/state` 能返回 JSON 之后，把下面这些加到 HA。
+固件跑起来、`http://<ESP32-IP>/filter/state` 能返回 JSON 之后，照下面做。
 
-## 0. 先扫描一次，让固件记住滤桶 MAC
+> 本文档的配置**已在 HA 2026.8.3 上实测跑通**，包含四个只有踩过才知道的坑。
 
-浏览器打开（`s` 是扫描秒数）：
+---
+
+## 0. 先让固件记住滤桶 MAC
 
 ```
 http://10.0.0.54/filter/scan?s=8
 ```
 
-返回里 `mac` 字段有值就成了。固件会把它存进 NVS，断电不丢。
+扫到后固件会记住。也可以在固件里写死 `FILTER_MAC_DEFAULT`。
 
-如果扫不到，把 ESP32 靠近滤桶，或者手动指定：
-
-```
-http://10.0.0.54/filter/setmac?mac=AA:BB:CC:DD:EE:FF
-```
-
-## 1. 接口一览
+## 1. 接口
 
 | 接口 | 作用 | 返回 |
 |---|---|---|
-| `/filter/state` | 读缓存状态 | `{connected,gear,model,err,charge,voltage,mac,age_ms}` |
-| `/filter/read` | 主动问设备要一次状态 | `{sent,gear,model}` |
-| `/filter/scan?s=8` | 扫描并记住滤桶 MAC | `{found,mac}` |
-| `/filter/setmac?mac=..` | 手动指定 MAC | `{mac}` |
-| `/filter/on` | 开泵（沿用当前档位） | `{sent,gear}` |
-| `/filter/off` | 停泵 | `{sent}` |
+| `/filter/state` | 读缓存（**不碰蓝牙**，适合高频轮询） | `{connected,gear,model,err,charge,voltage,mac}` |
+| `/filter/readgatt` | 连上去读一次真实状态 | `{len,raw,gear,model,...}` |
+| `/filter/read` | 写 `02 02` 到 EEE4 触发上报 | `{sent,gear,model}` |
+| `/filter/on` `/filter/off` | 开/停泵 | `{sent}` |
 | `/filter/speed?n=1..20` | 设档位 | `{sent,gear}` |
-| `/filter/feed?min=1..60` | 喂食暂停 N 分钟 | `{sent,minutes}` |
-| `/filter/backble` | 从实体按键模式切回蓝牙控制 | `{sent}` |
+| `/filter/feed?min=1..60` | 喂食暂停 | `{sent,minutes}` |
 
-状态字段含义：`gear` 0 表示停机；`model` 1=档位 2=档位+流量 3=喂食设置 5=喂食中 6=关 **7=自吸排气**；`err` 错误码。
+**关键**：`/filter/state` 只读固件缓存，不建立蓝牙连接，所以可以每 30 秒轮询；真正读设备要用 `/filter/readgatt`，每次会占用 1~2 秒的 BLE 连接。
 
-## 2. 加到 `sensor.yaml`
+## 2. 一个 REST sensor 拿全部状态（rest.yaml）
 
-```yaml
-- platform: rest
-  name: "滤桶档位"
-  resource: "http://10.0.0.54/filter/state"
-  method: GET
-  value_template: '{{ value_json.gear }}'
-  scan_interval: 30
-
-- platform: rest
-  name: "滤桶工作模式"
-  resource: "http://10.0.0.54/filter/state"
-  method: GET
-  value_template: '{{ value_json.model }}'
-  scan_interval: 30
-
-- platform: rest
-  name: "滤桶连接状态"
-  resource: "http://10.0.0.54/filter/state"
-  method: GET
-  value_template: '{{ value_json.connected }}'
-  scan_interval: 30
-```
-
-## 3. 加到 `rest_commands.yaml`
+不要为每个字段写一个 rest sensor（会 4 倍轮询），用 `json_attributes`：
 
 ```yaml
-filter_on:
-  url: "http://10.0.0.54/filter/on"
-  method: get
-filter_off:
-  url: "http://10.0.0.54/filter/off"
-  method: get
-filter_read:
-  url: "http://10.0.0.54/filter/read"
-  method: get
-filter_speed_1:
-  url: "http://10.0.0.54/filter/speed?n=1"
-  method: get
-# ... 2~20 各来一条，或者用下面的脚本方式
-filter_feed_10:
-  url: "http://10.0.0.54/filter/feed?min=10"
-  method: get
-filter_feed_20:
-  url: "http://10.0.0.54/filter/feed?min=20"
-  method: get
+- resource: "http://10.0.0.54/filter/state"
+  scan_interval: 30
+  timeout: 20
+  sensor:
+    - name: "netlea_filter"
+      unique_id: netlea_filter_state
+      value_template: "{{ value_json.gear }}"
+      icon: mdi:water-pump
+      json_attributes:
+        - gear
+        - model
+        - err
+        - charge
+        - voltage
+        - connected
+        - mac
 ```
 
-## 4. 加到 `template.yaml`
+## 3. 命令：用 shell_command + 外部脚本，不要用 rest_command 模板
+
+### ⚠️ 坑 1：`rest_command` 的 url 模板传参不生效
+
+文档说 `url` 支持模板，但实测：
+
+```yaml
+# 这样写，调用时传 data: {n: "9"} —— 实测无效，滤桶档位没变
+netlea_speed:
+  url: "http://10.0.0.54/filter/speed?n={{ n }}"
+```
+
+### ⚠️ 坑 2：action 名字不能模板化
+
+`action: "rest_command.netlea_speed_{{ option }}"` 从 2024.10 起被禁止，整个 `select` 块会被**静默丢弃**（不报错，实体就是不出现）。
+
+### ✅ 可行方案：shell_command + 外部脚本
+
+`/config/netlea_cmd.sh`：
+
+```sh
+#!/bin/sh
+url="$1"
+i=1
+r=""
+while [ "$i" -le 4 ]; do
+  r=$(curl -s -m 20 "$url")
+  case "$r" in
+    *'"sent":true'*) echo "$r"; exit 0 ;;
+    *'"len":'*)      echo "$r"; exit 0 ;;
+  esac
+  i=$((i+1))
+  sleep 2
+done
+echo "FAILED: $r"
+exit 1
+```
+
+`configuration.yaml`：
+
+```yaml
+shell_command:
+  netlea_speed_cmd: '/bin/sh /config/netlea_cmd.sh "http://10.0.0.54/filter/speed?n={{ n }}"'
+  netlea_on_cmd: '/bin/sh /config/netlea_cmd.sh "http://10.0.0.54/filter/on"'
+  netlea_off_cmd: '/bin/sh /config/netlea_cmd.sh "http://10.0.0.54/filter/off"'
+  netlea_feed_cmd: '/bin/sh /config/netlea_cmd.sh "http://10.0.0.54/filter/feed?min={{ min }}"'
+  netlea_read_cmd: '/bin/sh /config/netlea_cmd.sh "http://10.0.0.54/filter/readgatt"'
+```
+
+### ⚠️ 坑 3：YAML 单引号字符串里不能出现裸单引号
+
+想在一行里写 `case "$r" in *'"sent":true'*)` 会**直接把 YAML 打断**，HA 启动进入 safe mode（只剩十几个实体）。所有 shell 逻辑放 `.sh` 文件里，YAML 只写路径。
+
+### ⚠️ 坑 4：命令有概率第一次不生效
+
+滤桶是单连接设备，快速连断时 `ble_gap_connect` 会失败。实测首次成功率约 50%。上面的重试脚本（4 次，间隔 2 秒）实测 **4/4 成功**。
+
+## 4. 实体（template.yaml）
+
+### ⚠️ 坑 5：`options` 必须是模板字符串，不能是 YAML 列表
+
+```yaml
+# ❌ 报错：template value should be a string for 'select->0->options'
+options: ["1","2","3"]
+
+# ✅
+options: "{{ range(1, 21) | map('string') | list }}"
+```
+
+完整实体：
 
 ```yaml
 - switch:
     - name: "滤桶"
       unique_id: netlea_filter_switch
-      state: "{{ states('sensor.lu_tong_dang_wei')|int(0) > 0 }}"
+      state: "{{ (state_attr('sensor.netlea_filter','gear')|int(0)) > 0 }}"
       turn_on:
-        - action: rest_command.filter_on
+        - action: shell_command.netlea_on_cmd
       turn_off:
-        - action: rest_command.filter_off
+        - action: shell_command.netlea_off_cmd
       icon: mdi:water-pump
 
 - select:
     - name: "滤桶档位"
       unique_id: netlea_filter_gear
-      options: ["1","2","3","4","5","6","7","8","9","10",
-                "11","12","13","14","15","16","17","18","19","20"]
-      state: "{{ states('sensor.lu_tong_dang_wei') }}"
+      options: "{{ range(1, 21) | map('string') | list }}"
+      state: >-
+        {% set g = state_attr('sensor.netlea_filter','gear')|int(0) %}
+        {{ g if 1 <= g <= 20 else 1 }}
       select_option:
-        - action: rest_command.filter_speed_{{ option }}
+        - action: shell_command.netlea_speed_cmd
+          data:
+            n: "{{ option }}"
+      icon: mdi:speedometer
 
 - button:
     - name: "滤桶喂食10分钟"
-      unique_id: netlea_filter_feed10
       press:
-        - action: rest_command.filter_feed_10
+        - action: shell_command.netlea_feed_cmd
+          data:
+            min: "10"
 ```
 
-> `sensor.lu_tong_dang_wei` 是 HA 对「滤桶档位」自动生成的 entity_id，中文名会被拼音化。如果你的不一样，去「开发者工具 → 状态」里搜「滤桶」看实际 id。
+## 5. 定时刷新（automations.yaml）
 
-## 5. 一个必须注意的自动化坑
-
-**滤桶开机后要自吸排气（30 秒 ~ 15 分钟，`model=7`），这期间所有蓝牙控制会被设备拒绝。**
-
-所以「开机 + 设档位」不能连着发，要等状态变成 `model=1` 再发：
+固件重启后缓存是空的（`gear=-1`），要靠一次真实读取填充。加个定时任务：
 
 ```yaml
-- alias: 换水后恢复滤桶
-  triggers:
-    - trigger: state
-      entity_id: sensor.lu_tong_gong_zuo_mo_shi
-      to: "1"
-  actions:
-    - action: rest_command.filter_speed_8
+- id: netlea_filter_auto_refresh
+  alias: 滤桶状态定时刷新
+  trigger:
+    - platform: time_pattern
+      minutes: "/5"
+  action:
+    - action: shell_command.netlea_read_cmd
+  mode: single
 ```
 
-## 6. 单连接提醒
+## 6. 自吸排气期不能控
 
-ESP32 连着滤桶时，手机小程序连不上，反之亦然。固件是「发完命令立刻断开」，所以：
+滤桶开机后要排气 30 秒 ~ 15 分钟（`model=7`），期间设备拒绝蓝牙命令。自动化里"开机 + 设档位"要分开，等 `model` 变成 1 再设档。
 
-- 你在家想用小程序，随时可以用，不会有"设备被占用"的报错
-- 但 HA 里的状态是**缓存值**，不是实时的。想要最新状态就调一次 `/filter/read`
+## 7. 单连接提醒
+
+ESP32 连着滤桶时手机小程序连不上。固件是"命令后保持 20 秒、空闲自动断开"，所以你在家随时能用小程序，代价是状态有最多 30 秒延迟。
