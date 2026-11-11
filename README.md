@@ -1,10 +1,15 @@
 # 当贝投影仪 + 尼特利滤桶 · ESP32-C3 双控网关
 
+[![Release](https://img.shields.io/github/v/release/lee1985-cn/dangbei-netlea-hub?label=firmware&color=brightgreen)](https://github.com/lee1985-cn/dangbei-netlea-hub/releases/latest)
 [![Hardware: ESP32-C3](https://img.shields.io/badge/Hardware-ESP32--C3-blue.svg)](#)
 [![Integration: Home Assistant](https://img.shields.io/badge/Integration-Home%20Assistant-41BDF5.svg)](#)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-一块 ESP32-C3 同时干两件事：
+**中文** | [English](README.en.md)
+
+![架构图](docs/images/architecture.svg)
+
+一块 **ESP32-C3**（十几块钱的小板子，不需要任何外围电路）同时干两件事：
 
 1. **当贝投影仪纯本地控制** —— 开关机、音量、播放暂停，不依赖任何云
 2. **尼特利变频过滤桶控制** —— 开关、1~20 档、喂食暂停
@@ -12,6 +17,26 @@
 两个设备的控制互不干扰，全部通过局域网 HTTP 暴露给 Home Assistant。
 
 > 本项目基于 [lee1985-cn/dangbei-projector-ha](https://github.com/lee1985-cn/dangbei-projector-ha) 的投影仪固件扩展而来，投影仪部分的逻辑（双模软重启架构、信标唤醒、防吞键序列）原样保留。
+
+---
+
+## ⬇️ 不想编译？直接刷预编译固件
+
+到 [Releases](https://github.com/lee1985-cn/dangbei-netlea-hub/releases/latest) 下载，**不用装 PlatformIO，不用改代码**：
+
+| 文件 | 适用场景 | 烧录地址 |
+|---|---|---|
+| `*-app.bin` | 板子上已经有能跑的固件，只想换 app | `0x10000` |
+| `*-factory.bin` | 全新空板 / 想整片重刷 | `0x0` |
+
+```bash
+# 全新板子（推荐，一条命令搞定）
+esptool.py --chip esp32c3 --port COM3 write_flash 0x0 dangbei-netlea-hub-v1.0.0-factory.bin
+```
+
+刷完板子连不上 WiFi 会**自动开热点 `Dangbei-Setup`**，手机连上去打开 `http://192.168.4.1` 填 WiFi 就行 —— 不需要改源码重编。详见 [刷完配网](#刷完配网)。
+
+> 预编译固件里的 WiFi 是占位符，不含任何人的真实凭据，放心刷。
 
 ---
 
@@ -28,6 +53,9 @@ ESP32-C3 支持 BLE 双角色，NimBLE 默认允许 3 个连接，所以一块�
 
 ---
 
+<!-- 📷 待补：docs/images/demo.gif（HA 面板控制投影仪/滤桶的 30 秒录屏） -->
+<!-- 📷 待补：docs/images/ha-dashboard.png（Home Assistant 控制面板截图） -->
+
 ## 投影仪部分怎么工作（继承自原项目）
 
 当贝投影仪深度休眠时会过滤掉普通 BLE 键盘，所以固件用了**双模软重启**：
@@ -43,7 +71,7 @@ ESP32-C3 支持 BLE 双角色，NimBLE 默认允许 3 个连接，所以一块�
 
 ## 滤桶部分怎么工作
 
-尼特利没有公开协议，这份是从官方微信小程序逆向出来的，完整文档见 [docs/PROTOCOL.md](docs/PROTOCOL.md)。
+尼特利没有公开协议，这份是从官方微信小程序逆向出来的，完整文档见 **[docs/PROTOCOL.md](docs/PROTOCOL.md)**（GATT 特征表、帧格式、XOR 密钥、校验算法，全部在真机上写读验证过）。
 
 要点：
 
@@ -104,7 +132,7 @@ arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app \
 
 ## 烧录前的准备
 
-1. 改 `src/main.cpp` 顶部的 WiFi：
+1. （仅源码编译时需要）改 `src/main.cpp` 顶部的 WiFi，或者留空走配网热点：
 
 ```cpp
 const char* ssid = "你的wifi名字";
