@@ -7,7 +7,7 @@
 
 **中文** | [English](README.en.md)
 
-![架构图](docs/images/architecture.svg)
+![演示：Home Assistant 面板控制投影仪与滤桶](docs/images/demo.gif)
 
 一块 **ESP32-C3**（十几块钱的小板子，不需要任何外围电路）同时干两件事：
 
@@ -15,6 +15,10 @@
 2. **尼特利变频过滤桶控制** —— 开关、1~20 档、喂食暂停
 
 两个设备的控制互不干扰，全部通过局域网 HTTP 暴露给 Home Assistant。
+
+> 上面这段演示是鱼缸整体控制面板（2 倍速）：灯光、水泵、水温是米家/其他设备，**滤桶档位和蓝牙状态来自本项目**。
+
+![架构图](docs/images/architecture.svg)
 
 > 本项目基于 [lee1985-cn/dangbei-projector-ha](https://github.com/lee1985-cn/dangbei-projector-ha) 的投影仪固件扩展而来，投影仪部分的逻辑（双模软重启架构、信标唤醒、防吞键序列）原样保留。
 
@@ -52,9 +56,6 @@ ESP32-C3 支持 BLE 双角色，NimBLE 默认允许 3 个连接，所以一块�
 **前提是全局 `#define USE_NIMBLE`** —— 否则 BleKeyboard 会拉进来一套 Bluedroid，和滤桶的 GATT 客户端抢内存，两个都跑不稳。
 
 ---
-
-<!-- 📷 待补：docs/images/demo.gif（HA 面板控制投影仪/滤桶的 30 秒录屏） -->
-<!-- 📷 待补：docs/images/ha-dashboard.png（Home Assistant 控制面板截图） -->
 
 ## 投影仪部分怎么工作（继承自原项目）
 
@@ -204,6 +205,10 @@ esptool.py --port COM3 write_flash \
 | `/filter/backble` | 切回蓝牙控制 |
 
 Home Assistant 配置见 [docs/HA-CONFIG.md](docs/HA-CONFIG.md)。
+
+![鱼缸控制面板](docs/images/ha-dashboard.png)
+
+> 这是实际在用的鱼缸总控面板。其中 **滤桶档位**（`滤桶 8档`）和 **蓝牙状态**（`蓝牙待命`/`蓝牙已连`）由本项目提供，其余灯光、水泵、水温是米家等其他设备。
 
 ---
 

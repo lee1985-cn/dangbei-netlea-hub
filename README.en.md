@@ -7,7 +7,7 @@
 
 [中文](README.md) | **English**
 
-![Architecture](docs/images/architecture.svg)
+![Demo: controlling the projector and filter from a Home Assistant panel](docs/images/demo.gif)
 
 A **single ESP32-C3** (a ~$2 dev board, no extra circuitry) that plays **two BLE roles at the same time**:
 
@@ -15,6 +15,10 @@ A **single ESP32-C3** (a ~$2 dev board, no extra circuitry) that plays **two BLE
 - **BLE Central** — speaks the **reverse-engineered GATT protocol** of a **Netlea (尼特利) variable-speed canister filter** (on/off, speed 1–20, feeding pause).
 
 Both are exposed over plain LAN HTTP for Home Assistant. No MQTT broker, no vendor cloud, no app.
+
+> The demo above is the whole aquarium dashboard (2× speed). Lights, pump and water temperature come from other devices; **the filter gear and Bluetooth status are this project.**
+
+![Architecture](docs/images/architecture.svg)
 
 > This project extends the projector-only firmware in [lee1985-cn/dangbei-projector-ha](https://github.com/lee1985-cn/dangbei-projector-ha).
 
@@ -117,6 +121,10 @@ rest:
 ```
 
 Full config with automations, plus the four gotchas that cost real debugging time (including the fact that `rest_command`'s `url` template silently ignores `data:` parameters), is in **[docs/HA-CONFIG.md](docs/HA-CONFIG.md)** — tested on HA 2026.8.3.
+
+![Aquarium dashboard](docs/images/ha-dashboard.png)
+
+> The actual dashboard in use. **Filter gear** (`滤桶 8档`) and **Bluetooth status** (`蓝牙待命` / `蓝牙已连`) come from this project; the lights, pump and water temperature are other devices.
 
 ### HTTP API
 
