@@ -450,3 +450,92 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 
 说「大缸喂鱼」不再生效了。如果习惯改不过来，可以在小爱 App 的
 「训练计划」里加一条同义词，让「大缸喂鱼」也输出「60缸喂鱼」。
+
+---
+
+## 2026-11 补记：ASR 会把整句拆坏，只靠 content 关键词必然失效
+
+### 现象
+
+小爱训练命中、口头回复也正常，但三条自动化一次都不触发。翻对话历史，同一条命令被拆成两种残句：
+
+| 实际说 | 传感器 content | 缺了哪一半 |
+|---|---|---|
+| 六零缸喂鱼 | `六零缸位于`（喂鱼 wèiyú → 位于） | 动作词没了 |
+| 六零缸喂食 | `刘灵刚喂食`（六零缸 → 刘灵刚） | 缸的锚点没了 |
+| 取消喂鱼 | `取消位于` | 两边都没了 |
+
+旧条件要求「六/60/陆」**且**「喂/鲤/食」同时成立，残句各缺一半，永远凑不齐。
+
+### 根因二：对话传感器是「两次写入」
+
+miot 的对话传感器说一句话会写两次状态：
+
+1. 先写 `content` + `timestamp`，此时 **`answers` 是空列表 `[]`**
+2. 零点几秒后再单独写 `answers`（小爱实际念出来的回复）
+
+只监听 `attribute: timestamp` 时，条件在第一拍读到空 answers → 恒为 False。
+trace 里能看到 `to_state.attributes.answers == []`，而 `from_state` 还留着上一句的回复，
+极易误判成"属性没更新"。
+
+### 正解：以「小爱训练回复」为准确信号
+
+两个触发器都挂上，条件里以 `answers` 为主、`content` 兜底：
+
+```yaml
+triggers:
+- trigger: state
+  entity_id: [sensor.xiaomi_lx06_ac65_conversation, sensor.xiaomi_lx04_5d57_conversation]
+  attribute: timestamp
+- trigger: state
+  entity_id: [sensor.xiaomi_lx06_ac65_conversation, sensor.xiaomi_lx04_5d57_conversation]
+  attribute: answers
+conditions:
+- condition: template
+  value_template: >-
+    {% set c = state_attr(trigger.entity_id, 'content') | string %}
+    {% set a = state_attr(trigger.entity_id, 'answers') | string %}
+    {% set ts = as_timestamp(state_attr(trigger.entity_id, 'timestamp'), default=0) %}
+    {{ ((('六' in c or '60' in c or '陆' in c) and ('喂' in c or '鲤' in c or '食' in c))
+        or ('可以喂鱼' in a) or ('喂鱼了' in a))
+       and '取消' not in c and '不' not in c and '完' not in c
+       and ts > 0 and (as_timestamp(now()) - ts) < 40 }}
+```
+
+要点：
+
+- **负向词只约束 `content`，不要约束 `answers`**。训练回复里常带"注意 10 分钟后会自动关闭"
+  这类字，套上负向词会把条件否掉。
+- `answers` 里的关键词直接照抄小爱训练里配的回复文本：喂食用 `可以喂鱼`，取消用 `水泵`，
+  福特用 `已经启动`。改了训练词就要同步改这里。
+- 第一拍（timestamp）条件失败没关系，第二拍（answers）会再判一次；`mode: single` 保证不会重复执行。
+
+### 排障：看 trace，不要看当前状态
+
+```
+trace/list  → 看 run 的 last_step / script_execution
+              failed_conditions = 触发成功、但被条件拦下
+trace/get   → trigger/0[0].changed_variables.trigger.from_state / to_state.attributes
+```
+
+当前 `/api/states` 里的属性早被第二次写入覆盖，看不出问题；`last_triggered` 也不会因为
+条件失败而变化，所以"没触发"和"触发了但条件拦下"必须靠 trace 区分。
+
+### 安全测试：探针自动化
+
+1. 建一条触发/条件与目标一致、动作只发 `persistent_notification` 的自动化（id 用 `9900000000001`）
+2. 把三条真实自动化 `automation.turn_off`
+3. 往**离线的** `sensor.xiaomi_lx04_5d57_conversation` 伪写两次状态（先 `answers=[]`，再填回复）
+4. 看探针的 `last_triggered` 是否变化；测完删探针、恢复 `unavailable`、重新 `turn_on`
+
+全程不碰滤桶硬件。
+
+### 实测结论（2026-11-18）
+
+| 自动化 | 触发时间 | 小爱训练回复 |
+|---|---|---|
+| 60缸喂食 | 21:11:58 | 好的，可以喂鱼了 |
+| 60缸换水 | 21:17:03 | 好的，水泵将暂停30分钟 |
+| 取消喂食 | 21:17:13 | 好的，重新打开水泵！ |
+
+三条全部命中，ASR 残句（`六零缸位于` / `取消位于`）不再影响触发。
